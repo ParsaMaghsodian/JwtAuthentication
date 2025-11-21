@@ -3,7 +3,9 @@ using FluentValidation;
 using JwtAuthentication.DTO;
 using JwtAuthentication.Identity;
 using JwtAuthentication.Identity.Models;
+using JwtAuthentication.Shared;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
@@ -14,7 +16,7 @@ using System.Text;
 namespace JwtAuthentication.Services;
 
 public class UserService(UserDbContext context, UserManager<ApplicationUser> userManager,
-   IValidator<UserRegisterationRequest> registerValidator, IConfiguration configuration, IValidator<LoginUserRequest> loginValidator) : IUserService
+   IValidator<UserRegisterationRequest> registerValidator, IOptionsMonitor<JwtConfiguration> options, IValidator<LoginUserRequest> loginValidator) : IUserService
 {
     public async Task<ErrorOr<string>> LoginUserAsync(LoginUserRequest request)
     {
@@ -30,7 +32,7 @@ public class UserService(UserDbContext context, UserManager<ApplicationUser> use
             return Error.NotFound("Invalid UserName Or Password ");
         }
         var roles = await userManager.GetRolesAsync(user);
-        var singingKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(configuration["Jwt:SecretKey"]!)); // sign the token
+        var singingKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(options.CurrentValue.SecretKey)); // sign the token
         var credentials = new SigningCredentials(singingKey, SecurityAlgorithms.HmacSha256);
         // Collection Expressions 
         List<Claim> claims =
@@ -42,10 +44,10 @@ public class UserService(UserDbContext context, UserManager<ApplicationUser> use
         var tokenDescriptor = new SecurityTokenDescriptor
         {
             Subject = new ClaimsIdentity(claims),
-            Expires = DateTime.UtcNow.AddMinutes(configuration.GetValue<int>("Jwt:ExpirationInMinutes")),
+            Expires = DateTime.UtcNow.AddMinutes(options.CurrentValue.ExpirationInMinutes),
             SigningCredentials = credentials,
-            Issuer = configuration["Jwt:Issuer"],
-            Audience = configuration["Jwt:Audience"]
+            Issuer = options.CurrentValue.Issuer,
+            Audience =options.CurrentValue.Audience,
         }; 
 
         var tokenHandler = new JsonWebTokenHandler();
