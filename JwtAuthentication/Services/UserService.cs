@@ -5,10 +5,14 @@ using JwtAuthentication.Identity;
 using JwtAuthentication.Identity.Models;
 using JwtAuthentication.Shared;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
+using System.Linq.Expressions;
+using System.Net.WebSockets;
 using System.Security.Claims;
 using System.Text;
 
@@ -16,9 +20,18 @@ using System.Text;
 namespace JwtAuthentication.Services;
 
 public class UserService(UserDbContext context, UserManager<ApplicationUser> userManager,
-   IValidator<UserRegisterationRequest> registerValidator, IOptionsMonitor<JwtConfiguration> options, IValidator<LoginUserRequest> loginValidator) : IUserService
+   IValidator<UserRegisterationRequest> registerValidator, TokenProvider tokenProvider,
+   IValidator<LoginUserRequest> loginValidator, IValidator<LoginUserWithRefreshTokenRequest> loginWithRefreshTokenValidator, IHttpContextAccessor httpContextAccessor) : IUserService
 {
-    public async Task<ErrorOr<string>> LoginUserAsync(LoginUserRequest request)
+    private string? GetCurrentUserId()
+    {
+        var userIdString = httpContextAccessor.HttpContext?
+            .User
+            .FindFirstValue(ClaimTypes.NameIdentifier);
+        return userIdString;
+    }
+
+    public async Task<ErrorOr<LoginUserResponse>> LoginUserAsync(LoginUserRequest request)
     {
         var validationResult = await loginValidator.ValidateAsync(request);
         if (!validationResult.IsValid)
@@ -31,28 +44,70 @@ public class UserService(UserDbContext context, UserManager<ApplicationUser> use
         {
             return Error.NotFound("Invalid UserName Or Password ");
         }
-        var roles = await userManager.GetRolesAsync(user);
-        var singingKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(options.CurrentValue.SecretKey)); // sign the token
-        var credentials = new SigningCredentials(singingKey, SecurityAlgorithms.HmacSha256);
-        // Collection Expressions 
-        List<Claim> claims =
-         [
-            new(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub, user.Id),
-            new(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Nickname, user.UserName!),
-            ..roles.Select(role => new Claim(ClaimTypes.Role, role)) // spread operator — it inserts items from another collection.
-         ];
-        var tokenDescriptor = new SecurityTokenDescriptor
-        {
-            Subject = new ClaimsIdentity(claims),
-            Expires = DateTime.UtcNow.AddMinutes(options.CurrentValue.ExpirationInMinutes),
-            SigningCredentials = credentials,
-            Issuer = options.CurrentValue.Issuer,
-            Audience =options.CurrentValue.Audience,
-        }; 
+        string acessToken = await tokenProvider.GenerateAcessTokenAsync(user);
+        string refreshToken = await GetOrCreateRefreshTokenAsync(user);
 
-        var tokenHandler = new JsonWebTokenHandler();
-        string accessToken = tokenHandler.CreateToken(tokenDescriptor);
-        return accessToken;
+        return new LoginUserResponse(acessToken, refreshToken);
+    }
+    private async Task<string> GetOrCreateRefreshTokenAsync(ApplicationUser user)
+    {
+        var existingToken = await context.RefreshTokens
+            .FirstOrDefaultAsync(r => r.UserId == user.Id);
+
+        if (existingToken is null || existingToken.ExpiresOnUtc < DateTime.UtcNow)
+        {
+            // Create new or update expired refresh token
+            if (existingToken is null)
+            {
+                existingToken = new RefreshToken
+                {
+                    Id = Guid.NewGuid(),
+                    UserId = user.Id,
+                    ExpiresOnUtc = DateTime.UtcNow.AddDays(7),
+                    Token = tokenProvider.GenerateRefreshToken()
+                };
+                context.RefreshTokens.Add(existingToken);
+            }
+            else
+            {
+                existingToken.Token = tokenProvider.GenerateRefreshToken();
+                existingToken.ExpiresOnUtc = DateTime.UtcNow.AddDays(7);
+            }
+
+            await context.SaveChangesAsync();
+        }
+
+        // Return the valid refresh token
+        return existingToken.Token;
+    }
+
+    public async Task<ErrorOr<LoginUserWithRefreshTokenResponse>> LoginUserWithRefreshTokenAsync(LoginUserWithRefreshTokenRequest request)
+    {
+        var validationResult = await loginWithRefreshTokenValidator.ValidateAsync(request);
+        if (!validationResult.IsValid)
+        {
+            return validationResult.Errors
+        .Select(e => Error.Validation(
+            code: e.PropertyName,
+            description: e.ErrorMessage))
+        .ToList();
+
+        }
+        RefreshToken? refreshToken = await context.RefreshTokens
+             .Include(r => r.User)
+             .FirstOrDefaultAsync(rt => rt.Token == request.RefreshToken);
+        if (refreshToken is null || refreshToken.ExpiresOnUtc < DateTime.UtcNow)
+        {
+            return Error.NotFound("RefreshToken.Invalid", "The provided refresh token is invalid or has expired.");
+        }
+
+        string newAcessToken = await tokenProvider.GenerateAcessTokenAsync(refreshToken.User);
+        string newRefreshTokenString = tokenProvider.GenerateRefreshToken();
+        // Update the existing refresh token
+        refreshToken.Token = newRefreshTokenString;
+        refreshToken.ExpiresOnUtc = DateTime.UtcNow.AddDays(7);
+        await context.SaveChangesAsync();
+        return new LoginUserWithRefreshTokenResponse(newAcessToken, newRefreshTokenString);
     }
 
     public async Task<string> RegisterUserAsync(UserRegisterationRequest request)
@@ -78,5 +133,34 @@ public class UserService(UserDbContext context, UserManager<ApplicationUser> use
 
         return string.Empty;   // success
 
+    }
+
+    public async Task<ErrorOr<Success>> RevokeRefreshTokensAsync(string userId)
+    {
+        // Get the logged-in user's ID from JWT
+        var currentUserId = GetCurrentUserId();
+        if (currentUserId is null)
+        {
+            return Error.Forbidden("Auth.InvalidUser", "Could not determine the current user.");
+        }
+
+        // Ensure the user is only revoking their own refresh tokens
+        if (userId != currentUserId)
+        {
+            return Error.Forbidden("RevokingRefreshToken", "You cannot revoke refresh tokens for another user.");
+        }
+
+        // Convert to GUID to match the RefreshToken.UserId property
+        if (!Guid.TryParse(userId, out Guid parsedUserId))
+        {
+            return Error.Validation("User.InvalidId", "User ID is not a valid GUID.");
+        }
+
+        // Perform fast SQL DELETE
+        await context.RefreshTokens
+            .Where(r => r.UserId == userId)
+            .ExecuteDeleteAsync();
+
+        return Result.Success;
     }
 }

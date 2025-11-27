@@ -12,4 +12,5 @@ public class UserDbContext(DbContextOptions<UserDbContext> options) : IdentityDb
         builder.ApplyConfiguration(new ApplicationUserConfiguration());
         base.OnModelCreating(builder);
     }
+    public DbSet<RefreshToken> RefreshTokens  { get; set; }
 }
